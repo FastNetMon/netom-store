@@ -2,10 +2,10 @@
 categories = ["network-programming"]
 description = "A library for storing and retrieving IP Prefixes"
 documentation = "https://docs.rs/rotonda/"
-homepage = "https://nlnetlabs.nl/projects/routing/rotonda/"
+homepage = "https://github.com/FastNetMon/netom-store"
 keywords = ["routing", "bgp"]
 name = "rotonda-store"
-repository = "https://github.com/NLnetLabs/rotonda-store/"
+repository = "https://github.com/FastNetMon/netom-store"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -24,10 +24,10 @@ crossbeam-epoch = "^0.9"
 crossbeam-utils = "^0.8"
 parking_lot_core = "0.9.10"
 
-inetnum   = "0.1"
+inetnum = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1-fnm1" }
 log       = "^0.4"
 roaring 	= "0.10.3"
-routecore       = { version = "0.5.2", features = ["bgp", "bmp", "fsm", "serde", "mrt"] }
+routecore       = { git = "https://github.com/FastNetMon/routecore.git", tag = "v0.5.2-fnm1", features = ["bgp", "bmp", "fsm", "serde", "mrt"] }
 ansi_term   = { version = "0.12", optional = true }
 csv         = { version = "1", optional = true }
 rustyline   = { version = "15", optional = true }
