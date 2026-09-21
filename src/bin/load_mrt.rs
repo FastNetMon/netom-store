@@ -202,9 +202,14 @@ fn par_load_prefixes(
         .tables()
         .unwrap()
         .par_bridge()
-        .map(|(_fam, reh)| {
+        .map(|table| {
+            let (_fam, reh) = table.expect("invalid MRT table header");
             let iter = routecore::mrt::SingleEntryIterator::new(reh);
-            iter.map(|(prefix, peer_idx, _)| (prefix, peer_idx))
+            iter.map(|entry| {
+                let (prefix, peer_idx, _) =
+                    entry.expect("invalid MRT RIB entry");
+                (prefix, peer_idx)
+            })
         })
         .flatten_iter()
         .collect::<Vec<_>>();
@@ -234,12 +239,15 @@ fn mt_parse_and_insert_table<C: Config + Sync>(
         store.map_or(PersistStrategy::MemoryOnly, |p| p.persist_strategy());
     let counters = tables
         .par_bridge()
-        .map(|(_fam, reh)| {
+        .map(|table| {
+            let (_fam, reh) = table.expect("invalid MRT table header");
             let mut local_counters = UpsertCounters::default();
             let iter = routecore::mrt::SingleEntryIterator::new(reh);
             let persisted_prefixes = &mut vec![];
             // let mut cnt = 0;
-            for (prefix, peer_idx, pa_bytes) in iter {
+            for entry in iter {
+                let (prefix, peer_idx, pa_bytes) =
+                    entry.expect("invalid MRT RIB entry");
                 // cnt += 1;
                 // let (prefix, peer_idx, pa_bytes) = e;
                 let mui = peer_idx.into();
@@ -346,7 +354,13 @@ fn st_parse_and_insert_table<C: Config>(
     let mut cnt = 0;
     let t0 = std::time::Instant::now();
 
-    for (_, peer_idx, _, prefix, pamap) in entries {
+    for entry in entries {
+        let (_, peer_idx, _, nlri, _path_id, pamap) =
+            entry.expect("invalid MRT RIB entry");
+        // This prefix store cannot represent FlowSpec or other non-prefix NLRI.
+        let routecore::mrt::RibEntryNlri::Prefix(prefix) = nlri else {
+            continue;
+        };
         cnt += 1;
         let mui = peer_idx.into();
         let val = PaBytes(pamap);
