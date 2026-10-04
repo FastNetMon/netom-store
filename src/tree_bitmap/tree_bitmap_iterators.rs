@@ -187,12 +187,12 @@ impl<AF: AddressFamily, const ROOT_SIZE: usize> Iterator
         trace!("search lm prefix for {:?}", self.prefix);
 
         loop {
-            if self.prefix.len() == 0 {
-                return None;
-            }
-
             if self.tree.prefix_exists(self.prefix) {
                 return Some(self.prefix);
+            }
+
+            if self.prefix.len() == 0 {
+                return None;
             }
 
             self.prefix = self.prefix.truncate_to_len(self.prefix.len() - 1);
