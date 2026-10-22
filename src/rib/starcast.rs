@@ -614,9 +614,7 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
     /// Request a guard-free iterator over all prefix *keys* (IPv4 then IPv6).
     ///
     /// See [`Self::prefixes_keys_iter_v4`].
-    pub fn prefixes_keys_iter(
-        &'a self,
-    ) -> impl Iterator<Item = Prefix> + 'a {
+    pub fn prefixes_keys_iter(&'a self) -> impl Iterator<Item = Prefix> + 'a {
         self.v4
             .prefixes_keys_iter()
             .chain(self.v6.prefixes_keys_iter())
@@ -839,12 +837,76 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
         &self,
         mui: u32,
     ) -> Result<(usize, usize), PrefixStoreError> {
+        self.remove_muis(&[mui])
+    }
+
+    /// Physically remove a batch with a single prefix walk. The caller must
+    /// fence writes for these MUIs until completion. Other MUIs may be inserted
+    /// concurrently. Only MemoryOnly stores support physical removal.
+    ///
+    /// Prefix keys are owned, attributes are never collected, and each prefix
+    /// operation pins its own short-lived epoch guard. No guard crosses a yield.
+    pub fn remove_muis(
+        &self,
+        muis: &[u32],
+    ) -> Result<(usize, usize), PrefixStoreError> {
+        if self.config.persist_strategy() != PersistStrategy::MemoryOnly {
+            return Err(PrefixStoreError::FatalError);
+        }
+        if muis.is_empty() {
+            return Ok((0, 0));
+        }
+        let ids: std::collections::HashSet<u32> =
+            muis.iter().copied().collect();
+        let keys: Vec<Prefix> = self.prefixes_keys_iter().collect();
+        let mut total = (0, 0);
+        for (index, prefix) in keys.iter().enumerate() {
+            let delta = self.remove_muis_for_prefix(prefix, &ids)?;
+            total.0 += delta.0;
+            total.1 += delta.1;
+            if index % 512 == 511 {
+                std::thread::yield_now();
+            }
+        }
+        self.finish_remove_muis(muis)?;
+        Ok(total)
+    }
+
+    /// One resumable deletion step. Does NOT clear withdrawn status: callers
+    /// must only finish after every prefix and family was processed successfully.
+    pub fn remove_muis_for_prefix(
+        &self,
+        prefix: &Prefix,
+        muis: &std::collections::HashSet<u32>,
+    ) -> Result<(usize, usize), PrefixStoreError> {
         let guard = &epoch::pin();
+        if prefix.is_v4() {
+            self.v4
+                .remove_muis_for_prefix((*prefix).into(), muis, guard)
+        } else {
+            self.v6
+                .remove_muis_for_prefix((*prefix).into(), muis, guard)
+        }
+    }
 
-        let (records_v4, emptied_v4) = self.v4.remove_mui(mui, guard)?;
-        let (records_v6, emptied_v6) = self.v6.remove_mui(mui, guard)?;
+    /// Hide retired IDs in both families before beginning physical cleanup.
+    pub fn mark_muis_as_withdrawn(
+        &self,
+        muis: &[u32],
+    ) -> Result<(), PrefixStoreError> {
+        let guard = &epoch::pin();
+        self.v4.tree_bitmap.change_withdrawn(muis, true, guard)?;
+        self.v6.tree_bitmap.change_withdrawn(muis, true, guard)
+    }
 
-        Ok((records_v4 + records_v6, emptied_v4 + emptied_v6))
+    /// Finalize a successfully completed, write-fenced deletion.
+    pub fn finish_remove_muis(
+        &self,
+        muis: &[u32],
+    ) -> Result<(), PrefixStoreError> {
+        let guard = &epoch::pin();
+        self.v4.tree_bitmap.change_withdrawn(muis, false, guard)?;
+        self.v6.tree_bitmap.change_withdrawn(muis, false, guard)
     }
 
     /// Request whether the global status for IPv4 prefixes and the specified

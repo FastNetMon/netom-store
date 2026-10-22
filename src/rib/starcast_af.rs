@@ -1,4 +1,9 @@
-use std::path::Path;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    path::Path,
+    sync::Mutex,
+};
 
 use inetnum::addr::Prefix;
 use log::{info, trace};
@@ -53,6 +58,9 @@ pub(crate) struct StarCastAfRib<
     pub(crate) prefix_cht: PrefixCht<AF, M, P_ROOT_SIZE>,
     pub(crate) persist_tree: Option<LsmTree<AF, LongKey<AF>, KEY_SIZE>>,
     pub counters: Counters,
+    // Serialize existence-bit + record-map + counter transitions for a prefix.
+    // Fixed stripes avoid allocating a second lock for every stored prefix.
+    mutation_locks: Box<[Mutex<()>]>,
 }
 
 impl<
@@ -105,6 +113,7 @@ impl<
             tree_bitmap: TreeBitMap::<AF, N_ROOT_SIZE>::new()?,
             persist_tree,
             counters: Counters::default(),
+            mutation_locks: (0..4096).map(|_| Mutex::new(())).collect(),
             prefix_cht: PrefixCht::<AF, M, P_ROOT_SIZE>::init(),
         };
 
@@ -117,6 +126,10 @@ impl<
         record: Record<M>,
         update_path_selections: Option<M::TBI>,
     ) -> Result<UpsertReport, PrefixStoreError> {
+        let stripe = self.mutation_stripe(prefix);
+        let _mutation = self.mutation_locks[stripe]
+            .lock()
+            .map_err(|_| PrefixStoreError::FatalError)?;
         trace!("try insertingf {:?}", prefix);
         let guard = &epoch::pin();
         self.tree_bitmap
@@ -143,77 +156,38 @@ impl<
             })
     }
 
-    // Physically remove every record carrying `mui` from this address
-    // family's RIB, reclaiming the record slots that marking-as-withdrawn
-    // would otherwise leave behind forever. Emptied prefixes have their
-    // existence bit cleared, and `mui` is dropped from the global withdrawn
-    // index so a future reuse of the id starts clean.
-    //
-    // Returns `(records_removed, prefixes_emptied)`.
-    pub(crate) fn remove_mui(
+    fn mutation_stripe(&self, prefix: PrefixId<AF>) -> usize {
+        let mut hash = rustc_hash::FxHasher::default();
+        prefix.hash(&mut hash);
+        hash.finish() as usize % self.mutation_locks.len()
+    }
+
+    pub(crate) fn remove_muis_for_prefix(
         &self,
-        mui: u32,
+        prefix: PrefixId<AF>,
+        muis: &HashSet<u32>,
         guard: &Guard,
     ) -> Result<(usize, usize), PrefixStoreError> {
-        // Collect first, mutate second: never mutate the tree while one of its
-        // iterators is live. `include_withdrawn = true` is essential — without
-        // it a globally-withdrawn mui (the common teardown case) yields nothing
-        // and removal would silently no-op.
-        //
-        // The more-specifics walk yields strictly-longer prefixes than its
-        // 0/0 start, so a record on the default route itself must be added
-        // explicitly (`remove_mui_for_prefix` no-ops if this mui holds
-        // nothing there).
-        let default_route_id =
-            PrefixId::new(<AF as AddressFamily>::zero(), 0);
-        let default_route = if self.tree_bitmap.prefix_exists(default_route_id)
-        {
-            Some(default_route_id)
-        } else {
-            None
-        };
-        let prefixes: Vec<PrefixId<AF>> = default_route
-            .into_iter()
-            .chain(
-                self.more_specifics_iter_from(
-                    PrefixId::new(<AF as AddressFamily>::zero(), 0),
-                    Some(mui),
-                    true,
-                    guard,
-                )
-                .filter_map(|res| res.ok().map(|(prefix, _records)| prefix)),
-            )
-            .collect();
-
-        let mut records_removed = 0;
-        let mut prefixes_emptied = 0;
-
-        for prefix in prefixes {
-            let (removed, now_empty) = self
-                .prefix_cht
-                .remove_mui_for_prefix(prefix, mui)
-                .map_err(|_| PrefixStoreError::FatalError)?;
-            if removed {
-                records_removed += 1;
-                // Keep the family-level counters (the store's `total_count`)
-                // in step with the prefix-CHT counters decremented inside
-                // remove_mui_for_prefix (the `in_memory_count`).
-                self.counters.dec_routes_count();
-            }
-            if now_empty {
-                prefixes_emptied += 1;
-                self.tree_bitmap.set_prefix_absent(prefix)?;
-                self.counters.dec_prefixes_count(prefix.len());
-            }
+        if self.config.persist_strategy() != PersistStrategy::MemoryOnly {
+            // Removing only the memory copy could resurrect persisted routes.
+            return Err(PrefixStoreError::FatalError);
         }
-
-        // Every record for this mui is gone, so drop it from the withdrawn
-        // index. This writes the bitmap via the same unbounded CAS as
-        // mark_mui_as_withdrawn, so callers must serialize removals behind
-        // their own lock.
-        self.tree_bitmap.mark_mui_as_active(mui, guard)?;
-
-        Ok((records_removed, prefixes_emptied))
+        let stripe = self.mutation_stripe(prefix);
+        let _mutation = self.mutation_locks[stripe]
+            .lock()
+            .map_err(|_| PrefixStoreError::FatalError)?;
+        let (removed, emptied) = self
+            .prefix_cht
+            .remove_muis_for_prefix(prefix, muis, guard)
+            .map_err(|_| PrefixStoreError::FatalError)?;
+        for _ in 0..removed {
+            self.counters.dec_routes_count();
+        }
+        if emptied {
+            self.tree_bitmap.set_prefix_absent(prefix)?;
+            self.counters.dec_prefixes_count(prefix.len());
+        }
+        Ok((removed, usize::from(emptied)))
     }
 
     fn upsert_prefix(

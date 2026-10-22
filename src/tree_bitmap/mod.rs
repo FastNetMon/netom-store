@@ -223,7 +223,7 @@ use crate::stats::Counters;
 use crate::types::{BitSpan, PrefixId};
 #[cfg(test)]
 use crate::IPv6;
-use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
+use crossbeam_epoch::{Atomic, Guard, Owned};
 use log::{debug, error, log_enabled, trace};
 use node_cht::{NodeCht, NodeSet, StoredNode};
 use roaring::RoaringBitmap;
@@ -254,6 +254,7 @@ pub(crate) struct TreeBitMap<AF: AddressFamily, const ROOT_SIZE: usize> {
     node_cht: NodeCht<AF, ROOT_SIZE>,
     // the bitmap that holds RIB-wide withdrawn muis (e.g. peers)
     withdrawn_muis_bmin: Atomic<RoaringBitmap>,
+    withdrawn_writer: std::sync::Mutex<()>,
     // number of prefixes in the store, etc.
     counters: Counters,
     // see the rant on update_default_route_prefix_meta
@@ -265,6 +266,7 @@ impl<AF: AddressFamily, const ROOT_SIZE: usize> TreeBitMap<AF, ROOT_SIZE> {
         let tree_bitmap = Self {
             node_cht: Cht::init(),
             withdrawn_muis_bmin: RoaringBitmap::new().into(),
+            withdrawn_writer: std::sync::Mutex::new(()),
             counters: Counters::default(),
             default_route_exists: AtomicBool::new(false),
         };
@@ -500,9 +502,7 @@ Giving up this node. This shouldn't happen!",
                         // Already absent (e.g. a concurrent remover beat us).
                         return Ok(false);
                     }
-                    match node
-                        .pfxbitarr
-                        .compare_exchange(cur, cur & !bit_pos)
+                    match node.pfxbitarr.compare_exchange(cur, cur & !bit_pos)
                     {
                         CasResult(Ok(_)) => return Ok(true),
                         // The Err payload carries the now-current value, so we
@@ -587,14 +587,7 @@ Giving up this node. This shouldn't happen!",
         mui: u32,
         guard: &Guard,
     ) -> Result<(), PrefixStoreError> {
-        let current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
-
-        let mut new = unsafe { current.as_ref() }
-            .ok_or(PrefixStoreError::StoreNotReadyError)?
-            .clone();
-
-        new.remove(mui);
-        self.update_withdrawn_muis_bmin(current, new, guard)
+        self.change_withdrawn(&[mui], false, guard)
     }
 
     pub fn mark_mui_as_withdrawn(
@@ -602,46 +595,39 @@ Giving up this node. This shouldn't happen!",
         mui: u32,
         guard: &Guard,
     ) -> Result<(), PrefixStoreError> {
-        let current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
+        self.change_withdrawn(&[mui], true, guard)
+    }
 
+    pub(crate) fn change_withdrawn(
+        &self,
+        muis: &[u32],
+        withdrawn: bool,
+        guard: &Guard,
+    ) -> Result<(), PrefixStoreError> {
+        let _writer = self
+            .withdrawn_writer
+            .lock()
+            .map_err(|_| PrefixStoreError::FatalError)?;
+        let current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
         let mut new = unsafe { current.as_ref() }
             .ok_or(PrefixStoreError::StoreNotReadyError)?
             .clone();
-
-        new.insert(mui);
-
-        self.update_withdrawn_muis_bmin(current, new, guard)
-    }
-
-    pub(crate) fn update_withdrawn_muis_bmin<'a>(
-        &self,
-        current: Shared<'a, RoaringBitmap>,
-        mut new: RoaringBitmap,
-        guard: &'a Guard,
-    ) -> Result<(), PrefixStoreError> {
-        loop {
-            match self.withdrawn_muis_bmin.compare_exchange(
-                current,
-                Owned::new(new),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                guard,
-            ) {
-                Ok(_) => {
-                    // We replaced `current` with a fresh bitmap, so the old
-                    // allocation is now unreachable for any future reader.
-                    // Hand it to the epoch GC: without this the previous
-                    // RoaringBitmap leaks on every mui withdraw/activate.
-                    unsafe { guard.defer_destroy(current) };
-                    return Ok(());
-                }
-                Err(updated) => {
-                    new = unsafe { updated.current.as_ref() }
-                        .ok_or(PrefixStoreError::StoreNotReadyError)?
-                        .clone();
-                }
+        for mui in muis {
+            if withdrawn {
+                new.insert(*mui);
+            } else {
+                new.remove(*mui);
             }
         }
+        let old = self.withdrawn_muis_bmin.swap(
+            Owned::new(new),
+            Ordering::AcqRel,
+            guard,
+        );
+        unsafe {
+            guard.defer_destroy(old);
+        }
+        Ok(())
     }
 
     // Store a new node in the tree, or merge the existing node with this

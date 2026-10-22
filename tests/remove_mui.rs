@@ -112,8 +112,8 @@ mod tests {
 
     // Removing a mui that the store never saw must be a harmless no-op.
     #[test]
-    fn remove_unknown_mui_is_noop(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn remove_unknown_mui_is_noop() -> Result<(), Box<dyn std::error::Error>>
+    {
         let store = StarCastRib::<PrefixAs, MemoryOnlyConfig>::try_default()?;
         store.insert(&Prefix::from_str("192.0.2.0/24")?, active(1), None)?;
 
@@ -123,4 +123,214 @@ mod tests {
         assert_eq!(store.prefixes_count().total(), 1);
         Ok(())
     }
+}
+
+#[test]
+fn batch_removal_covers_defaults_both_families_and_is_idempotent() {
+    use rotonda_store::{
+        prefix_record::{Record, RouteStatus},
+        rib::{config::MemoryOnlyConfig, StarCastRib},
+        test_types::PrefixAs,
+    };
+    let store =
+        StarCastRib::<PrefixAs, MemoryOnlyConfig>::try_default().unwrap();
+    let prefixes: Vec<inetnum::addr::Prefix> =
+        ["0.0.0.0/0", "10.1.0.0/16", "::/0", "2001:db8::/32"]
+            .iter()
+            .map(|p| p.parse().unwrap())
+            .collect();
+    for p in &prefixes {
+        for mui in [1, 2, 3] {
+            store
+                .insert(
+                    p,
+                    Record::new(
+                        mui,
+                        0,
+                        RouteStatus::Active,
+                        PrefixAs::new_from_u32(mui),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(store.remove_muis(&[1, 2, 1]).unwrap(), (8, 0));
+    assert_eq!(store.remove_muis(&[1, 2]).unwrap(), (0, 0));
+    assert_eq!(store.routes_count().total(), 4);
+    assert_eq!(store.routes_count().in_memory(), 4);
+    assert_eq!(store.remove_muis(&[3]).unwrap(), (4, 4));
+    assert_eq!(store.remove_muis(&[3]).unwrap(), (0, 0));
+    assert_eq!(store.prefixes_count().total(), 0);
+    assert_eq!(store.prefixes_count().in_memory(), 0);
+    for p in &prefixes {
+        store
+            .insert(
+                p,
+                Record::new(
+                    4,
+                    0,
+                    RouteStatus::Active,
+                    PrefixAs::new_from_u32(4),
+                ),
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(store.prefixes_count().total(), 4);
+    assert_eq!(store.prefixes_count().in_memory(), 4);
+}
+
+#[test]
+fn concurrent_delete_and_insert_never_hides_survivor_or_drifts_counts() {
+    use rotonda_store::{
+        prefix_record::{Record, RouteStatus},
+        rib::{config::MemoryOnlyConfig, StarCastRib},
+        test_types::PrefixAs,
+    };
+    use std::sync::{Arc, Barrier};
+    let store = Arc::new(
+        StarCastRib::<PrefixAs, MemoryOnlyConfig>::try_default().unwrap(),
+    );
+    for round in 0..256u32 {
+        let p: inetnum::addr::Prefix =
+            format!("10.{}.{}.0/24", round / 256, round % 256)
+                .parse()
+                .unwrap();
+        store
+            .insert(
+                &p,
+                Record::new(
+                    1,
+                    0,
+                    RouteStatus::Active,
+                    PrefixAs::new_from_u32(1),
+                ),
+                None,
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let b = barrier.clone();
+            let s = &store;
+            scope.spawn(move || {
+                b.wait();
+                s.remove_muis_for_prefix(&p, &[1].into_iter().collect())
+                    .unwrap();
+            });
+            barrier.wait();
+            store
+                .insert(
+                    &p,
+                    Record::new(
+                        2,
+                        0,
+                        RouteStatus::Active,
+                        PrefixAs::new_from_u32(2),
+                    ),
+                    None,
+                )
+                .unwrap();
+        });
+        assert!(store.prefixes_keys_iter().any(|key| key == p));
+        let records = store
+            .get_records_for_prefix(&p, None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].multi_uniq_id, 2);
+        assert_eq!(store.routes_count().total(), (round + 1) as usize);
+        assert_eq!(store.routes_count().in_memory(), (round + 1) as usize);
+        assert_eq!(store.prefixes_count().total(), (round + 1) as usize);
+        assert_eq!(store.prefixes_count().in_memory(), (round + 1) as usize);
+    }
+}
+
+#[test]
+fn concurrent_bitmap_writers_preserve_every_operation() {
+    use rotonda_store::{
+        rib::{config::MemoryOnlyConfig, StarCastRib},
+        test_types::PrefixAs,
+    };
+    let store =
+        StarCastRib::<PrefixAs, MemoryOnlyConfig>::try_default().unwrap();
+    std::thread::scope(|scope| {
+        for mui in 1..65 {
+            let store = &store;
+            scope.spawn(move || {
+                store.mark_mui_as_withdrawn(mui).unwrap();
+            });
+        }
+    });
+    for mui in 1..65 {
+        assert!(store.mui_is_withdrawn_v4(mui));
+        assert!(store.mui_is_withdrawn_v6(mui));
+    }
+    std::thread::scope(|scope| {
+        for mui in 1..65 {
+            let store = &store;
+            scope.spawn(move || {
+                if mui % 2 == 0 {
+                    store.mark_mui_as_active_v4(mui).unwrap();
+                } else {
+                    store.mark_mui_as_withdrawn_v4(mui + 100).unwrap();
+                }
+            });
+        }
+    });
+    for mui in 1..65 {
+        assert_eq!(store.mui_is_withdrawn_v4(mui), mui % 2 == 1);
+        assert!(store.mui_is_withdrawn_v6(mui));
+        if mui % 2 == 1 {
+            assert!(store.mui_is_withdrawn_v4(mui + 100));
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual performance comparison; run with --release --ignored --nocapture"]
+fn batch_reclamation_workload() {
+    use rotonda_store::{
+        prefix_record::{Record, RouteStatus},
+        rib::{config::MemoryOnlyConfig, StarCastRib},
+        test_types::PrefixAs,
+    };
+    use std::time::Instant;
+    fn load() -> StarCastRib<PrefixAs, MemoryOnlyConfig> {
+        let store = StarCastRib::try_default().unwrap();
+        for n in 0..2048u32 {
+            let p: inetnum::addr::Prefix =
+                format!("10.{}.{}.0/24", n / 256, n % 256).parse().unwrap();
+            for mui in 0..128 {
+                store
+                    .insert(
+                        &p,
+                        Record::new(
+                            mui,
+                            0,
+                            RouteStatus::Active,
+                            PrefixAs::new_from_u32(mui),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        store
+    }
+    let single = load();
+    let batch = load();
+    let start = Instant::now();
+    for mui in 0..127 {
+        single.remove_mui(mui).unwrap();
+    }
+    let repeated = start.elapsed();
+    let start = Instant::now();
+    assert_eq!(
+        batch.remove_muis(&(0..127).collect::<Vec<_>>()).unwrap(),
+        (2048 * 127, 0)
+    );
+    let batched = start.elapsed();
+    assert_eq!(batch.routes_count().total(), single.routes_count().total());
+    println!("2048 prefixes, 128 peers: repeated single-ID scans {repeated:?}; one batch {batched:?}");
 }
