@@ -92,18 +92,14 @@ impl<
                 let persist_path = if let Some(pp) = config.persist_path() {
                     pp
                 } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "Missing persistence path".to_string(),
                     )
                     .into());
                 };
                 let pp_ref = &Path::new(&persist_path);
                 Some(LsmTree::new(pp_ref).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Cannot create persistence store",
-                    )
+                    std::io::Error::other("Cannot create persistence store")
                 })?)
             }
         };
@@ -127,7 +123,10 @@ impl<
         update_path_selections: Option<M::TBI>,
     ) -> Result<UpsertReport, PrefixStoreError> {
         let stripe = self.mutation_stripe(prefix);
-        let _mutation = self.mutation_locks[stripe]
+        let _mutation = self
+            .mutation_locks
+            .get(stripe)
+            .ok_or(PrefixStoreError::FatalError)?
             .lock()
             .map_err(|_| PrefixStoreError::FatalError)?;
         trace!("try insertingf {:?}", prefix);
@@ -173,7 +172,10 @@ impl<
             return Err(PrefixStoreError::FatalError);
         }
         let stripe = self.mutation_stripe(prefix);
-        let _mutation = self.mutation_locks[stripe]
+        let _mutation = self
+            .mutation_locks
+            .get(stripe)
+            .ok_or(PrefixStoreError::FatalError)?
             .lock()
             .map_err(|_| PrefixStoreError::FatalError)?;
         let (removed, emptied) = self

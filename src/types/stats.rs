@@ -8,12 +8,14 @@ use std::{
 
 use crate::{rib::STRIDE_SIZE, types::AddressFamily};
 
+#[allow(dead_code)]
 pub(crate) struct StrideStats<AF: AddressFamily> {
     pub(crate) created_nodes: Vec<CreatedNodes>,
     pub(crate) _prefixes_num: Vec<CreatedNodes>,
     _af: PhantomData<AF>,
 }
 
+#[allow(dead_code)]
 impl<AF: AddressFamily> StrideStats<AF> {
     pub fn new() -> Self {
         Self {
@@ -66,12 +68,12 @@ impl<AF: AddressFamily> Debug for StrideStats<AF> {
         write!(
             f,
             "Stride4:{:>8?} {:?} ({}k)",
-            &self.created_nodes.iter().fold(0, |mut a, n| {
+            self.created_nodes.iter().fold(0, |mut a, n| {
                 a += n.count;
                 a
             }),
-            &self.created_nodes,
-            &self.mem_usage() / 1024
+            self.created_nodes,
+            self.mem_usage() / 1024
         )
     }
 }
@@ -81,12 +83,12 @@ impl<AF: AddressFamily> Display for StrideStats<AF> {
         write!(
             f,
             "Stride4:{:>8?} {:?} ({}k)",
-            &self.created_nodes.iter().fold(0, |mut a, n| {
+            self.created_nodes.iter().fold(0, |mut a, n| {
                 a += n.count;
                 a
             }),
-            &self.created_nodes,
-            &self.mem_usage() / 1024
+            self.created_nodes,
+            self.mem_usage() / 1024
         )
     }
 }
@@ -105,7 +107,7 @@ impl CreatedNodes {
 
 impl Debug for CreatedNodes {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_fmt(format_args!("/{}: {}", &self.depth_level, &self.count))
+        f.write_fmt(format_args!("/{}: {}", self.depth_level, self.count))
     }
 }
 

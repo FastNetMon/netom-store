@@ -56,6 +56,9 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
             .map_err(|_| FatalError)
     }
 
+    // Read helpers cannot report lock failure. Fail immediately on poison
+    // rather than spin forever or expose a partially mutated record map.
+    #[allow(clippy::expect_used)]
     fn acquire_read_guard(&self) -> MutexGuard<'_, RecordMap<M>> {
         self.0.lock().expect("poisoned prefix record map")
     }

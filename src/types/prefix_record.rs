@@ -186,7 +186,7 @@ impl<M: Meta> RecordSet<M> {
         self.v4.is_empty() && self.v6.is_empty()
     }
 
-    pub fn iter(&self) -> RecordSetIter<M> {
+    pub fn iter(&self) -> RecordSetIter<'_, M> {
         RecordSetIter {
             v4: if self.v4.is_empty() {
                 None

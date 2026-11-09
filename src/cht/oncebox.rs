@@ -143,7 +143,9 @@ impl<T> OnceBoxSlice<T> {
                 // return current.
                 assert!(!current.is_null());
                 let _ = unsafe {
-                    Box::from_raw(slice::from_raw_parts_mut(ptr, self.size))
+                    Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        ptr, self.size,
+                    ))
                 };
                 current
             }
@@ -158,7 +160,9 @@ impl<T> Drop for OnceBoxSlice<T> {
         let ptr = self.ptr.swap(null_mut(), Ordering::Relaxed);
         if !ptr.is_null() {
             let _ = unsafe {
-                Box::from_raw(slice::from_raw_parts_mut(ptr, self.size))
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    ptr, self.size,
+                ))
             };
         }
     }
