@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -36,8 +36,7 @@ use crate::{
 /// `FxBuildHasher` instead of the default SipHash: the keys are internal `u32`
 /// mui values (no DoS-resistance needed), and SipHash on a u32 showed up as
 /// ~4-5% of CPU on the upsert path (`hash_one`) under load.
-type RecordMap<M> =
-    HashMap<u32, MultiMapValue<M>, rustc_hash::FxBuildHasher>;
+type RecordMap<M> = HashMap<u32, MultiMapValue<M>, rustc_hash::FxBuildHasher>;
 
 #[derive(Debug)]
 pub struct MultiMap<M: Meta>(Arc<Mutex<RecordMap<M>>>);
@@ -50,35 +49,18 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
     #[allow(clippy::type_complexity)]
     fn acquire_write_lock(
         &self,
-    ) -> FatalResult<(MutexGuard<RecordMap<M>>, usize)> {
-        let mut retry_count: usize = 0;
-        let backoff = Backoff::new();
-
-        loop {
-            // We're using lock(), which returns an Error only if another
-            // thread has panicked while holding the lock. In that situtation
-            // we are certainly not going to write anything.
-            if let Ok(guard) = self.0.lock().map_err(|_| FatalError) {
-                return Ok((guard, retry_count));
-            }
-
-            backoff.spin();
-            retry_count += 1;
-        }
+    ) -> FatalResult<(MutexGuard<'_, RecordMap<M>>, usize)> {
+        self.0
+            .lock()
+            .map(|guard| (guard, 0))
+            .map_err(|_| FatalError)
     }
 
-    fn acquire_read_guard(
-        &self,
-    ) -> MutexGuard<RecordMap<M>> {
-        let backoff = Backoff::new();
-
-        loop {
-            if let Ok(guard) = self.0.try_lock() {
-                return guard;
-            }
-
-            backoff.spin();
-        }
+    // Read helpers cannot report lock failure. Fail immediately on poison
+    // rather than spin forever or expose a partially mutated record map.
+    #[allow(clippy::expect_used)]
+    fn acquire_read_guard(&self) -> MutexGuard<'_, RecordMap<M>> {
+        self.0.lock().expect("poisoned prefix record map")
     }
 
     pub fn _len(&self) -> usize {
@@ -280,20 +262,26 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
         }
     }
 
-    // Physically drop the record for `mui` from this prefix's record map,
-    // releasing the MultiMapValue (and thereby its reference to the interned
-    // attribute blob). Unlike marking a mui as withdrawn (a status flip), this
-    // reclaims the HashMap slot. Returns `(removed, map_now_empty)`.
-    pub(crate) fn remove_mui(&self, mui: u32) -> FatalResult<(bool, bool)> {
-        let (mut record_map, _retry_count) = self.acquire_write_lock()?;
-        let removed = record_map.remove(&mui).is_some();
-        let now_empty = record_map.is_empty();
-        // HashMap::remove never shrinks capacity; reclaim it once the map has
-        // emptied out well below its allocation.
-        if removed && record_map.capacity() > 4 * record_map.len().max(1) {
-            record_map.shrink_to_fit();
+    // Delete a batch under one map lock. Do not clone route attributes.
+    pub(crate) fn remove_muis(
+        &self,
+        muis: &HashSet<u32>,
+    ) -> FatalResult<(usize, bool)> {
+        let (mut records, _) = self.acquire_write_lock()?;
+        let before = records.len();
+        if muis.len() < records.len() {
+            for mui in muis {
+                records.remove(mui);
+            }
+        } else {
+            records.retain(|mui, _| !muis.contains(mui));
         }
-        Ok((removed, now_empty))
+        let removed = before - records.len();
+        let emptied = removed != 0 && records.is_empty();
+        if removed != 0 && records.capacity() > 4 * records.len().max(1) {
+            records.shrink_to_fit();
+        }
+        Ok((removed, emptied))
     }
 }
 #[derive(Clone, Debug)]
@@ -667,7 +655,10 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
                         prefix.len()
                     );
                     }
-                    prefix_is_new = false;
+                    prefix_is_new = stored_prefix.record_map._len() == 0;
+                    if prefix_is_new {
+                        self.counters.inc_prefixes_count(prefix.len());
+                    }
 
                     // Update the already existing record_map with our
                     // caller's record.
@@ -680,10 +671,10 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
 
                     // if the mui is new, we didn't overwrite an existing
                     // route, so that's a new one!
-                    if mui_count.is_none() {
-                        mui_is_new = true;
+                    mui_is_new = mui_count.is_none();
+                    if mui_is_new {
                         self.counters.inc_routes_count();
-                    };
+                    }
 
                     if let Some(tbi) = update_path_selections {
                         stored_prefix
@@ -844,30 +835,27 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
         }
     }
 
-    // Physically remove the record for `mui` at `prefix`, keeping this CHT's
-    // own counters in sync (these back the `in_memory_count` reported by the
-    // store). Returns `(removed, now_empty)`, where `now_empty` means the
-    // prefix has no records left for any mui. A `false`/`false` result means
-    // the prefix (or its record for this mui) was not present.
-    pub(crate) fn remove_mui_for_prefix(
+    pub(crate) fn remove_muis_for_prefix(
         &self,
         prefix: PrefixId<AF>,
-        mui: u32,
-    ) -> FatalResult<(bool, bool)> {
-        if let (Some(stored_prefix), _) =
-            self.non_recursive_retrieve_prefix(prefix)
+        muis: &HashSet<u32>,
+        guard: &Guard,
+    ) -> FatalResult<(usize, bool)> {
+        if let (Some(stored), _) = self.non_recursive_retrieve_prefix(prefix)
         {
-            let (removed, now_empty) =
-                stored_prefix.record_map.remove_mui(mui)?;
-            if removed {
+            // Even if the best path belonged to a removed MUI, no old
+            // selection may be served as current after the mutation.
+            stored.set_ps_outdated(guard).map_err(|_| FatalError)?;
+            let (removed, emptied) = stored.record_map.remove_muis(muis)?;
+            for _ in 0..removed {
                 self.counters.dec_routes_count();
             }
-            if now_empty {
+            if emptied {
                 self.counters.dec_prefixes_count(prefix.len());
             }
-            Ok((removed, now_empty))
+            Ok((removed, emptied))
         } else {
-            Ok((false, false))
+            Ok((0, false))
         }
     }
 

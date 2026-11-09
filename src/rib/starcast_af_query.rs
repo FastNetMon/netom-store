@@ -217,9 +217,7 @@ impl<
                 options.include_withdrawn,
                 guard,
             )
-            .map(|res| {
-                res.and_then(|v| if v.is_empty() { None } else { Some(v) })
-            })
+            .map(|res| res.filter(|v| !v.is_empty()))
         }) {
             res.records = m;
         } else {

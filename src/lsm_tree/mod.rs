@@ -190,15 +190,7 @@ impl<AF: AddressFamily, K: Key<AF, KEY_SIZE>, const KEY_SIZE: usize>
                     .into_iter()
                     .collect::<lsm_tree::Result<Vec<FatalResult<Vec<u8>>>>>()
                     .ok()
-                    .and_then(
-                        |recs| {
-                            if recs.is_empty() {
-                                None
-                            } else {
-                                Some(recs)
-                            }
-                        },
-                    )
+                    .filter(|recs| !recs.is_empty())
             }
             // All muis, include withdrawn routes
             (None, true) => {
@@ -228,15 +220,7 @@ impl<AF: AddressFamily, K: Key<AF, KEY_SIZE>, const KEY_SIZE: usize>
                     .into_iter()
                     .collect::<lsm_tree::Result<Vec<FatalResult<Vec<u8>>>>>()
                     .ok()
-                    .and_then(
-                        |recs| {
-                            if recs.is_empty() {
-                                None
-                            } else {
-                                Some(recs)
-                            }
-                        },
-                    )
+                    .filter(|recs| !recs.is_empty())
             }
             // All muis, exclude withdrawn routes
             (None, false) => {
@@ -287,15 +271,7 @@ impl<AF: AddressFamily, K: Key<AF, KEY_SIZE>, const KEY_SIZE: usize>
                     .into_iter()
                     .collect::<lsm_tree::Result<Vec<FatalResult<Vec<u8>>>>>()
                     .ok()
-                    .and_then(
-                        |recs| {
-                            if recs.is_empty() {
-                                None
-                            } else {
-                                Some(recs)
-                            }
-                        },
-                    )
+                    .filter(|recs| !recs.is_empty())
             }
             // Specific mui, exclude withdrawn routes
             (Some(mui), false) => {
@@ -328,15 +304,7 @@ impl<AF: AddressFamily, K: Key<AF, KEY_SIZE>, const KEY_SIZE: usize>
                     .into_iter()
                     .collect::<lsm_tree::Result<Vec<FatalResult<Vec<u8>>>>>()
                     .ok()
-                    .and_then(
-                        |recs| {
-                            if recs.is_empty() {
-                                None
-                            } else {
-                                Some(recs)
-                            }
-                        },
-                    )
+                    .filter(|recs| !recs.is_empty())
             }
         }
     }
